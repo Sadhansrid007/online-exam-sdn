@@ -8,6 +8,11 @@ The system consists of a central examination server and multiple student clients
 
 Students connect to the examination server, receive multiple-choice questions, submit their answers and receive their scores.
 
+## D1 – Project Overview
+
+The following mind map provides an overview of the major components implemented as part of Deliverable 1 (D1).
+
+![D1 Project Overview](docs/d1-project-overview.png)
 ## 2. Objectives
 
 - Implement reliable client-server communication using TCP sockets.

@@ -173,3 +173,7 @@ The next development phase will focus on:
 ## 12. Authors
 
 Add the names and contributions of all project team members here.
+## 13. Additional Documentation
+
+- [Network Architecture](docs/architecture.md)
+- [Initial Test Results](docs/test-results.md)

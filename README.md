@@ -77,15 +77,13 @@ No third-party Python packages are required by the current socket application or
 
 ## 7. Running the Project
 
-Use three terminal windows.
+Use two terminal windows.
 
 ### Terminal 1 — Start the SDN Controller
 
 ```bash
 cd ~/online-exam-sdn
 python3 raw_controller.py
-```
-
 The controller listens on port 6653.
 
 ### Terminal 2 — Start the Mininet Topology

@@ -2,22 +2,38 @@
 import socket
 import struct
 import threading
+import json
+import ipaddress
 
 HOST = "0.0.0.0"
 PORT = 6653
+ADMIN_HOST = "127.0.0.1"
+ADMIN_PORT = 6654
 OF_VERSION = 4
 
 NO_BUFFER = 0xffffffff
 OFPP_FLOOD = 0xfffffffb
 OFPP_CONTROLLER = 0xfffffffd
 OFPP_ANY = 0xffffffff
+OFPG_ANY = 0xffffffff
 
 mac_tables = {}
+switches = {}
+switches_lock = threading.Lock()
 
 
 def message(msg_type, xid, body=b""):
     length = 8 + len(body)
     return struct.pack("!BBHI", OF_VERSION, msg_type, length, xid) + body
+
+
+def send_switch(state, msg_type, body=b"", xid=None):
+    with state["send_lock"]:
+        if xid is None:
+            xid = state["xid"]
+            state["xid"] += 1
+
+        state["conn"].sendall(message(msg_type, xid, body))
 
 
 def receive_exact(conn, size):
@@ -30,7 +46,7 @@ def receive_exact(conn, size):
     return data
 
 
-def send_table_miss(conn, xid):
+def send_table_miss(state):
     fixed = struct.pack(
         "!QQBBHHHIIIH2x",
         0, 0, 0, 0, 0, 0, 0,
@@ -41,7 +57,7 @@ def send_table_miss(conn, xid):
     instruction = struct.pack("!HH4x", 4, 24)
     action = struct.pack("!HHIH6x", 0, 16, OFPP_CONTROLLER, 65535)
 
-    conn.sendall(message(14, xid, fixed + match + instruction + action))
+    send_switch(state, 14, fixed + match + instruction + action)
 
 
 def get_packet_info(body):
@@ -78,7 +94,7 @@ def get_packet_info(body):
     return buffer_id, in_port, src_mac, dst_mac, packet
 
 
-def send_flow_mod(conn, xid, dst_mac, out_port):
+def send_flow_mod(state, dst_mac, out_port):
     fixed = struct.pack(
         "!QQBBHHHIIIH2x",
         0, 0, 0, 0, 60, 0, 100,
@@ -95,21 +111,139 @@ def send_flow_mod(conn, xid, dst_mac, out_port):
     instruction = struct.pack("!HH4x", 4, 24)
     action = struct.pack("!HHIH6x", 0, 16, out_port, 0)
 
-    conn.sendall(message(14, xid, fixed + match + instruction + action))
+    send_switch(state, 14, fixed + match + instruction + action)
 
 
-def send_packet_out(conn, xid, packet, out_port):
+def send_packet_out(state, packet, out_port):
     body = struct.pack("!IIH6x", NO_BUFFER, OFPP_CONTROLLER, 16)
     body += struct.pack("!HHIH6x", 0, 16, out_port, 0)
     body += packet
 
-    conn.sendall(message(13, xid, body))
+    send_switch(state, 13, body)
+
+
+def ipv4_policy_match(student_ip):
+    fields = (
+        struct.pack("!HBB", 0x8000, 5 << 1, 2)
+        + struct.pack("!H", 0x0800)
+        + struct.pack("!HBB", 0x8000, 11 << 1, 4)
+        + socket.inet_aton(student_ip)
+        + struct.pack("!HBB", 0x8000, 12 << 1, 4)
+        + socket.inet_aton("10.0.0.1")
+    )
+
+    match_length = 4 + len(fields)
+    match = struct.pack("!HH", 1, match_length) + fields
+    padding = b"\x00" * ((8 - len(match) % 8) % 8)
+
+    return match + padding
+
+
+def apply_policy(state, action, student_ip):
+    command = 0 if action == "BLOCK" else 4
+
+    fixed = struct.pack(
+        "!QQBBHHHIIIH2x",
+        0xD200000000000001, 0,
+        0, command, 0, 0, 200,
+        NO_BUFFER, OFPP_ANY, OFPG_ANY, 0
+    )
+
+    body = fixed + ipv4_policy_match(student_ip)
+    send_switch(state, 14, body)
+
+
+def handle_admin_client(conn, address):
+    print(f"[ADMIN] Connected: {address}")
+
+    try:
+        reader = conn.makefile("r")
+
+        for line in reader:
+            try:
+                request = json.loads(line)
+                action = str(request.get("action", "")).upper()
+                student_ip = str(request.get("ip", ""))
+
+                if action not in ("BLOCK", "UNBLOCK"):
+                    raise ValueError("Action must be BLOCK or UNBLOCK")
+
+                parsed_ip = ipaddress.ip_address(student_ip)
+
+                if parsed_ip.version != 4:
+                    raise ValueError("Only IPv4 addresses are supported")
+
+                if student_ip == "10.0.0.1":
+                    raise ValueError("Cannot block the examination server")
+
+                with switches_lock:
+                    active_switches = list(switches.values())
+
+                if not active_switches:
+                    raise RuntimeError("No switch is connected")
+
+                for state in active_switches:
+                    apply_policy(state, action, student_ip)
+
+                print(f"[DYNAMIC POLICY] {action} {student_ip}")
+
+                response = {
+                    "status": "success",
+                    "action": action,
+                    "ip": student_ip,
+                    "switches_updated": len(active_switches)
+                }
+
+            except (ValueError, TypeError, json.JSONDecodeError,
+                    RuntimeError, OSError) as error:
+                response = {
+                    "status": "error",
+                    "message": str(error)
+                }
+
+            conn.sendall((json.dumps(response) + "\n").encode())
+
+    except (ConnectionError, OSError) as error:
+        print("[ADMIN ERROR]", error)
+
+    finally:
+        conn.close()
+
+
+def admin_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((ADMIN_HOST, ADMIN_PORT))
+    server.listen(5)
+
+    print(f"[ADMIN] Policy interface listening on port {ADMIN_PORT}")
+
+    try:
+        while True:
+            conn, address = server.accept()
+            threading.Thread(
+                target=handle_admin_client,
+                args=(conn, address),
+                daemon=True
+            ).start()
+
+    finally:
+        server.close()
 
 
 def handle_switch(conn, address):
     print(f"[CONNECTED] Switch: {address}")
-    xid = 1
+
+    state = {
+        "conn": conn,
+        "send_lock": threading.Lock(),
+        "xid": 1
+    }
+
     mac_tables[address] = {}
+
+    with switches_lock:
+        switches[address] = state
 
     try:
         while True:
@@ -136,24 +270,18 @@ def handle_switch(conn, address):
 
             if msg_type == 0:
                 print("[HELLO] OpenFlow 1.3")
-                conn.sendall(message(0, received_xid))
-                conn.sendall(message(5, xid))
-                xid += 1
+                send_switch(state, 0, xid=received_xid)
+                send_switch(state, 5)
                 print("[FEATURES REQUEST] Sent to switch")
 
             elif msg_type == 2:
-                conn.sendall(message(3, received_xid, body))
+                send_switch(state, 3, body, xid=received_xid)
 
             elif msg_type == 6:
                 print("[FEATURES REPLY] Received from switch")
 
-                conn.sendall(
-                    message(9, xid, struct.pack("!HH", 0, 65535))
-                )
-                xid += 1
-
-                send_table_miss(conn, xid)
-                xid += 1
+                send_switch(state, 9, struct.pack("!HH", 0, 65535))
+                send_table_miss(state)
 
                 print("[FEATURES] Switch connected successfully")
                 print("[FLOW] Table-miss rule installed")
@@ -172,20 +300,16 @@ def handle_switch(conn, address):
                 if dst_mac in table and table[dst_mac] != in_port:
                     out_port = table[dst_mac]
 
-                    send_flow_mod(conn, xid, dst_mac, out_port)
-                    xid += 1
-
-                    send_packet_out(conn, xid, packet, out_port)
-                    xid += 1
+                    send_flow_mod(state, dst_mac, out_port)
+                    send_packet_out(state, packet, out_port)
 
                     print(
-                        f"[LEARNED FLOW] {dst_mac.hex(':')} -> port {out_port}"
+                        f"[LEARNED FLOW] {dst_mac.hex(':')} "
+                        f"-> port {out_port}"
                     )
 
                 else:
-                    send_packet_out(conn, xid, packet, OFPP_FLOOD)
-                    xid += 1
-
+                    send_packet_out(state, packet, OFPP_FLOOD)
                     print(f"[FLOOD] Unknown destination {dst_mac.hex(':')}")
 
             elif msg_type == 1:
@@ -197,10 +321,20 @@ def handle_switch(conn, address):
     finally:
         conn.close()
         mac_tables.pop(address, None)
+
+        with switches_lock:
+            if switches.get(address) is state:
+                switches.pop(address, None)
+
         print("[DISCONNECTED]", address)
 
 
 def main():
+    threading.Thread(
+        target=admin_server,
+        daemon=True
+    ).start()
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))

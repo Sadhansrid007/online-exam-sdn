@@ -5,3 +5,6 @@ sdn-env/
 *.log
 .DS_Store
 controller.py
+
+# Local D1 backup
+raw_controller_d1_backup.py
